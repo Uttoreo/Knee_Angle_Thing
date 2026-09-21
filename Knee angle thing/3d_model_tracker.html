@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-width=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Knee ROM Tracker - 3D Spatial Model</title>
+    
+    <!-- MediaPipe Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    
+    <!-- Three.js for 3D Rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+    <style>
+        body { margin: 0; padding: 0; background-color: #121212; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; height: 100vh; overflow: hidden; }
+        .nav { width: 100%; padding: 15px; background: #000; text-align: center; z-index: 10; position: relative;}
+        .nav a { color: #00e676; text-decoration: none; font-weight: bold; margin: 0 10px; }
+        #canvas-container { position: relative; width: 100%; height: 60vh; background-color: #111; cursor: grab;}
+        #canvas-container:active { cursor: grabbing; }
+        video { display: none; }
+        .dashboard { width: 100%; padding: 20px; box-sizing: border-box; background: #1e1e1e; flex-grow: 1; text-align: center; }
+        h2 { margin: 0 0 10px 0; color: #00e676; }
+        p { color: #aaa; margin: 0 0 20px 0; font-size: 0.9rem;}
+        .angle-display { font-size: 3rem; font-weight: bold; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 1.2rem; color: #00e676; z-index: 5;}
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <span>Mode: </span>
+        <a href="index.html">Camera Overlay</a> | 
+        <a href="3d_model_tracker.html" style="color:white; border-bottom: 2px solid white;">3D Spatial Model</a>
+    </div>
+
+    <div id="canvas-container">
+        <div id="loading">Loading AI & 3D Environment...</div>
+        <video class="input_video"></video>
+    </div>
+
+    <div class="dashboard">
+        <h2>Live 3D Knee Angle</h2>
+        <p>Drag the 3D space above to rotate the model and view your knee from any angle.</p>
+        <div class="angle-display" id="angle-display">--°</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const loadingEl = document.getElementById('loading');
+        const angleDisplay = document.getElementById('angle-display');
+        const container = document.getElementById('canvas-container');
+
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+        
+        // Add a grid floor to help with 3D perspective
+        const gridHelper = new THREE.GridHelper(4, 20, 0x444444, 0x222222);
+        gridHelper.position.y = -1;
+        scene.add(gridHelper);
+
+        const camera3D = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+        camera3D.position.set(0, 0, 3); // Stand back from the model
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        container.appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera3D, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // Group to hold our skeleton
+        const skeletonGroup = new THREE.Group();
+        scene.add(skeletonGroup);
+
+        // Spheres for joints
+        const materialJoint = new THREE.MeshBasicMaterial({ color: 0x00e676 });
+        const sphereGeo = new THREE.SphereGeometry(0.04, 16, 16);
+        
+        // Lines for bones
+        const materialBone = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 3 });
+
+        let jointMeshes = [];
+        let boneLines = [];
+
+        // Resize handler
+        window.addEventListener('resize', () => {
+            camera3D.aspect = container.clientWidth / container.clientHeight;
+            camera3D.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        });
+
+        // Animation Loop for Three.js
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera3D);
+        }
+        animate();
+
+        // --- ANGLE MATH ---
+        function calculate3DAngle(a, b, c) {
+            const ba = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+            const bc = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+            const dotProduct = (ba.x * bc.x) + (ba.y * bc.y) + (ba.z * bc.z);
+            const magBA = Math.sqrt(ba.x*ba.x + ba.y*ba.y + ba.z*ba.z);
+            const magBC = Math.sqrt(bc.x*bc.x + bc.y*bc.y + bc.z*bc.z);
+            return Math.acos(dotProduct / (magBA * magBC)) * (180.0 / Math.PI);
+        }
+
+        // --- MEDIAPIPE LOGIC ---
+        function onResults(results) {
+            if (loadingEl.style.display !== 'none') {
+                loadingEl.style.display = 'none';
+            }
+
+            if (results.poseWorldLandmarks) {
+                const landmarks = results.poseWorldLandmarks;
+
+                // Figure out which leg is clearest
+                const leftVis = (landmarks[23].visibility + landmarks[25].visibility + landmarks[27].visibility) / 3;
+                const rightVis = (landmarks[24].visibility + landmarks[26].visibility + landmarks[28].visibility) / 3;
+                const isLeft = leftVis > rightVis;
+
+                // Clear old skeleton
+                skeletonGroup.clear();
+
+                // Get key points
+                const hip = isLeft ? landmarks[23] : landmarks[24];
+                const knee = isLeft ? landmarks[25] : landmarks[26];
+                const ankle = isLeft ? landmarks[27] : landmarks[28];
+                const conf = isLeft ? leftVis : rightVis;
+
+                if (conf > 0.5) {
+                    // Render 3D Model of the Leg
+                    const points = [hip, knee, ankle];
+                    const points3D = [];
+
+                    points.forEach(p => {
+                        // MediaPipe Y is inverted compared to Three.js
+                        const v = new THREE.Vector3(p.x, -p.y, -p.z); 
+                        points3D.push(v);
+                        
+                        const sphere = new THREE.Mesh(sphereGeo, materialJoint);
+                        sphere.position.copy(v);
+                        skeletonGroup.add(sphere);
+                    });
+
+                    // Draw Thigh Bone
+                    const geoThigh = new THREE.BufferGeometry().setFromPoints([points3D[0], points3D[1]]);
+                    const lineThigh = new THREE.Line(geoThigh, materialBone);
+                    skeletonGroup.add(lineThigh);
+
+                    // Draw Shin Bone
+                    const geoShin = new THREE.BufferGeometry().setFromPoints([points3D[1], points3D[2]]);
+                    const lineShin = new THREE.Line(geoShin, materialBone);
+                    skeletonGroup.add(lineShin);
+
+                    // Update Angle
+                    const angle = Math.round(calculate3DAngle(hip, knee, ankle));
+                    angleDisplay.innerText = angle + "°";
+                } else {
+                    angleDisplay.innerText = "--°";
+                }
+            }
+        }
+
+        const pose = new Pose({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`});
+        pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, enableSegmentation: false, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        pose.onResults(onResults);
+
+        const camera = new Camera(videoElement, { onFrame: async () => { await pose.send({image: videoElement}); }, width: 640, height: 480, facingMode: "environment" });
+        camera.start();
+    </script>
+</body>
+</html>
